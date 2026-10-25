@@ -7,7 +7,8 @@
 - Fix: the TCP connect timeout is raised from 5s to 10s, so slow-to-answer fans fail with `connection timed out` less often
 - Fix: a fan that accepts the connection but never finishes the protocol 3.4/3.5 handshake no longer leaves the accessory stuck offline. The connect attempt is aborted after 20s and retried
 - Errors that happen on a working connection no longer force a reconnect. A failed connect attempt is now logged once instead of twice
-- A write the fan doesn't confirm (`Timeout waiting for status response`) now triggers one reconnect and one resend. If that also fails, the plugin re-reads the fan's real state so HomeKit doesn't keep showing a change that never happened
+- Fix: `Timeout waiting for status response` after every command. The fan carries out commands but often sends no status reply, so the plugin no longer waits for one. Commands also no longer queue behind each other for 5s each
+- Debug mode now logs the raw data points (dps) the fan reports
 
 ## 2.2.2
 

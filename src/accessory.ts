@@ -115,8 +115,7 @@ export class FanAccessory {
   // down. Flushed once the device reconnects. Calling tuyaDevice.set() while
   // disconnected makes tuyapi auto-connect *outside* our backoff, which feeds
   // the reconnect war and produces 'Timeout waiting for status response'.
-  // `retried` marks a write that already failed once on a live connection.
-  private readonly queuedWrites = new Map<number, { value: DpsPrimitive; retried: boolean }>();
+  private readonly queuedWrites = new Map<number, DpsPrimitive>();
 
   constructor(
     private readonly platform: HomebridgeCreateCeilingFan,
@@ -312,8 +311,9 @@ export class FanAccessory {
         this.log.debug(`${this.accessory.displayName}:`, `Ignored malformed packet -> ${error}`);
         return;
       }
+      // connect() logs connect failures. A status timeout (e.g. from the
+      // refresh tuyapi issues on connect) is a missing reply, not a failure.
       if (this.isConnecting || isStatusTimeout(error)) {
-        // connect() / sendCommand() log these and handle the recovery.
         this.log.debug(`${this.accessory.displayName}:`, `Error -> ${error}`);
         return;
       }
@@ -467,7 +467,7 @@ export class FanAccessory {
         // Don't let tuyapi auto-connect outside our backoff. Keep the latest
         // desired value and flush it once 'connected' fires. HomeKit already
         // shows the optimistic state from the onSet handler.
-        this.queuedWrites.set(dps, { value, retried: false });
+        this.queuedWrites.set(dps, value);
         this.log.debug(`${this.accessory.displayName}:`, `queued dps ${dps}=${value} until reconnect`);
         return;
       }
@@ -476,49 +476,21 @@ export class FanAccessory {
     this.pendingWrites.set(dps, { value, timer });
   }
 
-  private sendCommand(dps: number, value: DpsPrimitive, retried = false) {
+  private sendCommand(dps: number, value: DpsPrimitive) {
     this.recentWrites.set(dps, { value, at: Date.now() });
     this.log.debug(`${this.accessory.displayName}:`, `sendCommand(${dps}, ${value})`);
-    this.tuyaDevice.set({ dps, set: value }).catch(err => {
+    // Don't wait for a STATUS reply: CREATE fans apply the command but often
+    // never send one, so tuyapi would report 'Timeout waiting for status
+    // response' for every successful write (and hold its one-at-a-time set
+    // queue for 5s each). State reports the fan does send arrive via 'data'.
+    this.tuyaDevice.set({ dps, set: value, shouldWaitForResponse: false }).catch(err => {
+      // The socket dropped between the connection check and the write. Re-queue
+      // so the value is flushed on the next reconnect instead of being lost.
       if (!this.isConnected) {
-        // The socket dropped between the connection check and the write.
-        // Re-queue so the value is flushed on the next reconnect.
-        this.queuedWrites.set(dps, { value, retried });
-        this.log.warn(`${this.accessory.displayName}:`, `set dps ${dps} failed -> ${err}`);
-        return;
+        this.queuedWrites.set(dps, value);
       }
-      if (!retried && isStatusTimeout(err)) {
-        // The fan didn't confirm the write on a socket that still answers
-        // pings: its session is often wedged and ignoring commands. Reconnect
-        // and resend once.
-        this.log.warn(
-          `${this.accessory.displayName}:`,
-          `Fan did not confirm dps ${dps}=${value} — reconnecting and retrying once`,
-        );
-        this.queuedWrites.set(dps, { value, retried: true });
-        // Retry promptly: the user is waiting on this command, so don't apply
-        // the escalated backoff of earlier flaps.
-        this.reconnectAttempts = 0;
-        this.tuyaDevice.disconnect();
-        this.handleConnectionLost();
-        return;
-      }
-      // Give up and re-read the fan so HomeKit shows its real state instead
-      // of our optimistic one.
-      this.log.warn(`${this.accessory.displayName}:`, `set dps ${dps}=${value} failed -> ${err}`);
-      this.resyncState();
+      this.log.warn(`${this.accessory.displayName}:`, `set dps ${dps} failed -> ${err}`);
     });
-  }
-
-  private resyncState() {
-    this.tuyaDevice.get({ schema: true })
-      .then(data => {
-        if (typeof data === 'object' && data !== null) {
-          this.markSeen();
-          this.applyDps((data as { dps?: Record<string, unknown> }).dps);
-        }
-      })
-      .catch(err => this.log.debug(`${this.accessory.displayName}:`, `resync failed -> ${err}`));
   }
 
   private flushQueuedWrites() {
@@ -528,8 +500,8 @@ export class FanAccessory {
     const queued = [...this.queuedWrites];
     this.queuedWrites.clear();
     this.log.debug(`${this.accessory.displayName}:`, `flushing ${queued.length} queued write(s)`);
-    for (const [dps, { value, retried }] of queued) {
-      this.sendCommand(dps, value, retried);
+    for (const [dps, value] of queued) {
+      this.sendCommand(dps, value);
     }
   }
 

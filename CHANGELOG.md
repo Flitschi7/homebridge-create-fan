@@ -6,7 +6,8 @@
 - Fix: frequent `Disconnected` -> reconnect cycles every few minutes. tuyapi dropped the connection whenever a single heartbeat reply was more than 2s late, which Wi-Fi fan modules in power-save mode often are. The plugin now drops the connection only when the fan has sent nothing at all for 35s
 - Fix: the TCP connect timeout is raised from 5s to 10s, so slow-to-answer fans fail with `connection timed out` less often
 - Fix: a fan that accepts the connection but never finishes the protocol 3.4/3.5 handshake no longer leaves the accessory stuck offline. The connect attempt is aborted after 20s and retried
-- Non-fatal errors (e.g. `Timeout waiting for status response`) no longer force a reconnect, and a failed connect attempt is logged once instead of twice
+- Errors that happen on a working connection no longer force a reconnect. A failed connect attempt is now logged once instead of twice
+- A write the fan doesn't confirm (`Timeout waiting for status response`) now triggers one reconnect and one resend. If that also fails, the plugin re-reads the fan's real state so HomeKit doesn't keep showing a change that never happened
 
 ## 2.2.2
 

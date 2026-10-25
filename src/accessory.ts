@@ -496,6 +496,9 @@ export class FanAccessory {
           `Fan did not confirm dps ${dps}=${value} — reconnecting and retrying once`,
         );
         this.queuedWrites.set(dps, { value, retried: true });
+        // Retry promptly: the user is waiting on this command, so don't apply
+        // the escalated backoff of earlier flaps.
+        this.reconnectAttempts = 0;
         this.tuyaDevice.disconnect();
         this.handleConnectionLost();
         return;
@@ -556,6 +559,7 @@ export class FanAccessory {
     if (!dps) {
       return;
     }
+    this.log.debug(`${this.accessory.displayName}:`, `Tuya dps -> ${JSON.stringify(dps)}`);
     let changed = false;
 
     const lightDps = dps[String(DPS_LIGHT)];

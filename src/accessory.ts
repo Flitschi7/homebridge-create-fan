@@ -8,7 +8,7 @@ type DpsPrimitive = string | number | boolean;
 const WRITE_DEBOUNCE_MS = 250;
 const ECHO_SUPPRESS_MS = 1500;
 const TOGGLE_RESET_MS = 500;
-const RECONNECT_BACKOFF_MS = [5_000, 10_000, 30_000, 60_000, 120_000] as const;
+const RECONNECT_BACKOFF_MS = [5_000, 10_000, 20_000, 30_000, 60_000] as const;
 // Randomised +/- fraction added to each backoff delay. Tuya devices accept a
 // single local TCP connection: when a second client (a stray Homebridge
 // instance, Home Assistant, the Tuya cloud keep-alive...) reconnects, the fan
@@ -116,6 +116,10 @@ export class FanAccessory {
   // disconnected makes tuyapi auto-connect *outside* our backoff, which feeds
   // the reconnect war and produces 'Timeout waiting for status response'.
   private readonly queuedWrites = new Map<number, DpsPrimitive>();
+  // Writes sent since the fan last sent us anything. Writes are fire-and-forget
+  // (see sendCommand), so if the link turns out to be dead these were most
+  // likely lost and are re-sent after the reconnect.
+  private readonly unconfirmedWrites = new Map<number, DpsPrimitive>();
 
   constructor(
     private readonly platform: HomebridgeCreateCeilingFan,
@@ -354,6 +358,7 @@ export class FanAccessory {
 
   private markSeen() {
     this.lastSeenAt = Date.now();
+    this.unconfirmedWrites.clear();
   }
 
   private startLivenessWatchdog() {
@@ -385,6 +390,13 @@ export class FanAccessory {
   }
 
   private handleConnectionLost() {
+    for (const [dps, value] of this.unconfirmedWrites) {
+      // A newer value queued in the meantime wins.
+      if (!this.queuedWrites.has(dps)) {
+        this.queuedWrites.set(dps, value);
+      }
+    }
+    this.unconfirmedWrites.clear();
     this.isConnected = false;
     this.cancelStabilityTimer();
     this.stopLivenessWatchdog();
@@ -478,6 +490,7 @@ export class FanAccessory {
 
   private sendCommand(dps: number, value: DpsPrimitive) {
     this.recentWrites.set(dps, { value, at: Date.now() });
+    this.unconfirmedWrites.set(dps, value);
     this.log.debug(`${this.accessory.displayName}:`, `sendCommand(${dps}, ${value})`);
     // Don't wait for a STATUS reply: CREATE fans apply the command but often
     // never send one, so tuyapi would report 'Timeout waiting for status

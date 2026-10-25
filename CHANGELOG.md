@@ -9,6 +9,8 @@
 - Errors that happen on a working connection no longer force a reconnect. A failed connect attempt is now logged once instead of twice
 - Fix: `Timeout waiting for status response` after every command. The fan carries out commands but often sends no status reply, so the plugin no longer waits for one. Commands also no longer queue behind each other for 5s each
 - Debug mode now logs the raw data points (dps) the fan reports
+- Commands sent while the connection was silently dead are re-sent after the reconnect instead of being lost
+- Reconnect backoff now tops out at 60s instead of 120s, so the fan comes back sooner after a Wi-Fi dropout
 
 ## 2.2.2
 

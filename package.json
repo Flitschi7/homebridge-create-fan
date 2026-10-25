@@ -2,7 +2,7 @@
   "name": "homebridge-create-ceiling-fan",
   "displayName": "Hombridge Create Ceiling Fan",
   "type": "module",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "private": false,
   "description": "Free the full potential of your ceiling fan with Homebridge",
   "author": "Thibaut Mottet",
@@ -19,7 +19,7 @@
   ],
   "main": "dist/index.js",
   "engines": {
-    "node": "^18.20.4 || ^20.15.1 || ^22",
+    "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
     "homebridge": "^1.8.0 || ^2.0.0-beta.0 || ^2.0.0"
   },
   "scripts": {
@@ -35,7 +35,7 @@
   "devDependencies": {
     "@eslint/js": "9.19.0",
     "@types/eslint__js": "8.42.3",
-    "@types/node": "22.10.10",
+    "@types/node": "24.19.0",
     "eslint": "9.19.0",
     "homebridge": "2.0.0-beta.88",
     "nodemon": "3.1.9",

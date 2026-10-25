@@ -21,6 +21,31 @@ const RECONNECT_JITTER = 0.3;
 // RST) would otherwise reset the counter on every brief 'connected' event,
 // turning the exponential backoff into a tight 5s loop.
 const STABLE_CONNECTION_MS = 30_000;
+// tuyapi pings every 10s and tears the connection down when a single pong is
+// more than 2s late. Wi-Fi Tuya modules in power-save routinely answer slower
+// than that, which shows up as a bare 'Disconnected' every few minutes on an
+// otherwise healthy link. We keep tuyapi's pings but replace its watchdog with
+// a tolerant one: only give up after this long without any traffic from the fan
+// (~3 missed pongs).
+const LIVENESS_TIMEOUT_MS = 35_000;
+const LIVENESS_CHECK_MS = 5_000;
+// tuyapi's default TCP connect timeout is 5s, too short for sleepy Wi-Fi modules.
+const CONNECT_TIMEOUT_S = 10;
+// Upper bound for a whole connect (TCP + 3.4/3.5 session key handshake). tuyapi
+// has no timeout on the handshake: if the fan accepts the socket but never
+// answers, connect() never settles and the accessory would stay offline forever.
+const CONNECT_GUARD_MS = 20_000;
+
+// Private tuyapi members we tune. tuyapi is pinned to an exact version in
+// package.json; every access is guarded so a future change degrades to stock
+// tuyapi behaviour instead of crashing.
+type TuyaInternals = {
+  _connectTimeout?: number;
+  _pingPongTimeout?: NodeJS.Timeout | null;
+  _sendPing?: () => Promise<void>;
+  client?: { destroy(): void };
+  connectPromise?: { reject(error: Error): void };
+};
 
 const DPS_LIGHT = 20;
 const DPS_FAN = 60;
@@ -76,6 +101,8 @@ export class FanAccessory {
   private isConnected = false;
   private reconnectTimer?: NodeJS.Timeout;
   private stabilityTimer?: NodeJS.Timeout;
+  private livenessTimer?: NodeJS.Timeout;
+  private lastSeenAt = 0;
   private reconnectAttempts = 0;
   private fanState: { Active: 0 | 1; RotationSpeed: number; RotationDirection: 0 | 1 };
   private lightState: { On: boolean; Brightness: number };
@@ -242,15 +269,15 @@ export class FanAccessory {
       version: accessory.context.device.version ?? '3.4',
       issueRefreshOnConnect: true,
     });
+    this.tuneTuyaInternals();
     this.tuyaDevice.on('disconnected', () => {
       this.log.info(`${this.accessory.displayName}:`,'Disconnected');
-      this.isConnected = false;
-      this.cancelStabilityTimer();
-      this.scheduleReconnect();
+      this.handleConnectionLost();
     });
     this.tuyaDevice.on('connected', () => {
       this.log.info(`${this.accessory.displayName}:`,'Connected!');
       this.isConnected = true;
+      this.startLivenessWatchdog();
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = undefined;
@@ -271,22 +298,116 @@ export class FanAccessory {
         this.reconnectAttempts = 0;
       }, STABLE_CONNECTION_MS);
     });
+    // 'error' never drives reconnects. A dead socket always reaches us another
+    // way: tuyapi emits 'disconnected' on socket close, a failed connect rejects
+    // connect(), and a silently dead link is caught by the liveness watchdog.
+    // Errors like 'Timeout waiting for status response' or a malformed packet
+    // happen on healthy sockets, and reconnecting on them only caused churn.
     this.tuyaDevice.on('error', error => {
-      // A malformed/partial packet on a still-healthy socket is not a
-      // connection failure: log it quietly and keep the connection instead of
-      // reconnecting. This prevents one bad packet from restarting the plugin.
       if (isPacketDecodeError(error)) {
         this.log.debug(`${this.accessory.displayName}:`, `Ignored malformed packet -> ${error}`);
         return;
       }
-      this.log.warn(`${this.accessory.displayName}:`, `Error -> ${error.toString()}`);
-      this.isConnected = false;
-      this.cancelStabilityTimer();
-      this.scheduleReconnect();
+      if (this.isConnecting) {
+        // connect() logs the failure and schedules the retry.
+        this.log.debug(`${this.accessory.displayName}:`, `Error while connecting -> ${error}`);
+        return;
+      }
+      this.log.warn(`${this.accessory.displayName}:`, `Error -> ${error}`);
     });
-    this.tuyaDevice.on('data', data => this.applyDps(data?.dps));
-    this.tuyaDevice.on('dp-refresh', data => this.applyDps(data?.dps));
+    this.tuyaDevice.on('heartbeat', () => this.markSeen());
+    this.tuyaDevice.on('data', data => {
+      this.markSeen();
+      this.applyDps(data?.dps);
+    });
+    this.tuyaDevice.on('dp-refresh', data => {
+      this.markSeen();
+      this.applyDps(data?.dps);
+    });
     this.connect();
+  }
+
+  private tuneTuyaInternals() {
+    const internals = this.tuyaDevice as unknown as TuyaInternals;
+    if (typeof internals._connectTimeout === 'number') {
+      internals._connectTimeout = CONNECT_TIMEOUT_S;
+    }
+    const sendPing = internals._sendPing;
+    if (typeof sendPing === 'function') {
+      internals._sendPing = async () => {
+        try {
+          await sendPing.call(internals);
+        } finally {
+          // Disarm tuyapi's 2s pong deadline; checkLiveness() handles dead links.
+          if (internals._pingPongTimeout) {
+            clearTimeout(internals._pingPongTimeout);
+          }
+          internals._pingPongTimeout = null;
+        }
+      };
+    }
+  }
+
+  private markSeen() {
+    this.lastSeenAt = Date.now();
+  }
+
+  private startLivenessWatchdog() {
+    this.stopLivenessWatchdog();
+    this.markSeen();
+    this.livenessTimer = setInterval(() => this.checkLiveness(), LIVENESS_CHECK_MS);
+  }
+
+  private stopLivenessWatchdog() {
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = undefined;
+    }
+  }
+
+  private checkLiveness() {
+    const silentFor = Date.now() - this.lastSeenAt;
+    if (!this.isConnected || silentFor < LIVENESS_TIMEOUT_MS) {
+      return;
+    }
+    this.log.warn(
+      `${this.accessory.displayName}:`,
+      `No response from fan for ${Math.round(silentFor / 1000)}s — reconnecting`,
+    );
+    // Emits 'disconnected' synchronously; handleConnectionLost() is idempotent
+    // and covers the case where tuyapi already considered itself disconnected.
+    this.tuyaDevice.disconnect();
+    this.handleConnectionLost();
+  }
+
+  private handleConnectionLost() {
+    this.isConnected = false;
+    this.cancelStabilityTimer();
+    this.stopLivenessWatchdog();
+    this.scheduleReconnect();
+  }
+
+  private connectWithGuard(): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      const guard = setTimeout(() => {
+        this.abortConnect();
+        reject(new Error(`no response within ${CONNECT_GUARD_MS / 1000}s`));
+      }, CONNECT_GUARD_MS);
+      this.tuyaDevice.connect()
+        .then(resolve, reject)
+        .finally(() => clearTimeout(guard));
+    });
+  }
+
+  private abortConnect() {
+    const internals = this.tuyaDevice as unknown as TuyaInternals;
+    internals.client?.destroy();
+    // tuyapi hands this same pending promise to every later connect() call
+    // until it settles, so it must be dropped or we could never connect again.
+    if (internals.connectPromise) {
+      internals.connectPromise.reject(new Error('connect aborted'));
+      delete internals.connectPromise;
+    }
   }
 
   async connect() {
@@ -296,7 +417,7 @@ export class FanAccessory {
     this.isConnecting = true;
     this.log.info(`${this.accessory.displayName}:`, 'Connecting...');
     try {
-      await this.tuyaDevice.connect();
+      await this.connectWithGuard();
     } catch (err) {
       this.log.warn(`${this.accessory.displayName}:`, `connect failed -> ${err}`);
     } finally {

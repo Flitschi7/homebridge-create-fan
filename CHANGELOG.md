@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.3.0
+
+- Support Node.js 24
+- Fix: frequent `Disconnected` -> reconnect cycles every few minutes. tuyapi dropped the connection whenever a single heartbeat reply was more than 2s late, which Wi-Fi fan modules in power-save mode often are. The plugin now drops the connection only when the fan has sent nothing at all for 35s
+- Fix: the TCP connect timeout is raised from 5s to 10s, so slow-to-answer fans fail with `connection timed out` less often
+- Fix: a fan that accepts the connection but never finishes the protocol 3.4/3.5 handshake no longer leaves the accessory stuck offline. The connect attempt is aborted after 20s and retried
+- Non-fatal errors (e.g. `Timeout waiting for status response`) no longer force a reconnect, and a failed connect attempt is logged once instead of twice
+
 ## 2.2.2
 
 - Fix: a fan whose config is missing a required field (`ip`, `id`, or `key`) is now skipped at startup with a clear error message naming the field, instead of failing with obscure connection timeouts. This helps users who upgraded from 2.0.x without adding the static `ip` that became mandatory in 2.1.0
